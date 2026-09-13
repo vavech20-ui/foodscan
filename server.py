@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from openai import OpenAI
+import google.generativeai as genai
 import json
 import os
 import base64
@@ -34,28 +34,32 @@ SYSTEM_PROMPT = """Ты — эксперт по анализу состава п
 В additives добавляй только компоненты, вызывающие вопросы."""
 
 
-def compress_image(image_base64: str) -> str:
+def compress_image(image_base64: str) -> bytes:
+    """Сжимает изображение и возвращает bytes."""
     try:
         from PIL import Image
         if ',' in image_base64:
             image_base64 = image_base64.split(',')[1]
         img_bytes = base64.b64decode(image_base64)
-        if len(img_bytes) <= 1_500_000:
-            return image_base64
+        
         img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
         max_side = 1600
         ratio = min(max_side / img.width, max_side / img.height, 1.0)
         if ratio < 1.0:
             img = img.resize((int(img.width*ratio), int(img.height*ratio)), Image.LANCZOS)
+        
         buf = io.BytesIO()
-        img.save(buf, format='JPEG', quality=82, optimize=True)
-        return base64.b64encode(buf.getvalue()).decode('utf-8')
+        img.save(buf, format='JPEG', quality=85, optimize=True)
+        return buf.getvalue()
     except Exception as e:
         print(f'Compression error: {e}')
-        return image_base64.split(',')[1] if ',' in image_base64 else image_base64
+        if ',' in image_base64:
+            return base64.b64decode(image_base64.split(',')[1])
+        return base64.b64decode(image_base64)
 
 
 def extract_json(text: str) -> dict:
+    """Извлекает JSON из ответа модели."""
     text = text.strip()
     if '```json' in text:
         text = text.split('```json', 1)[1].split('```', 1)[0]
@@ -77,34 +81,35 @@ def analyze():
         if not image:
             return jsonify({'error': 'Изображение не получено'}), 400
 
-        image_b64 = compress_image(image)
-
+        # Настраиваем Gemini API
         api_key = os.getenv('GEMINI_API_KEY')
         if not api_key:
             return jsonify({'error': 'GEMINI_API_KEY не задан'}), 500
 
-        client = OpenAI(
-            api_key=api_key,
-            base_url='https://generativelanguage.googleapis.com/v1beta/openai/'
-        )
-        resp = client.chat.completions.create(
-            model='gemini-2.0-flash',
-            messages=[
-                {'role': 'system', 'content': SYSTEM_PROMPT},
-                {'role': 'user', 'content': [
-                    {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{image_b64}'}},
-                    {'type': 'text', 'text': 'Проанализируй состав продукта на фото.'}
-                ]}
-            ],
-            temperature=0.3,
-            max_tokens=1500
-        )
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.0-flash')
 
-        result = extract_json(resp.choices[0].message.content)
+        # Сжимаем изображение
+        image_bytes = compress_image(image)
+
+        # Делаем запрос
+        response = model.generate_content([
+            SYSTEM_PROMPT,
+            {
+                'mime_type': 'image/jpeg',
+                'data': image_bytes
+            },
+            'Проанализируй состав продукта на фото.'
+        ])
+
+        result = extract_json(response.text)
+        
+        # Валидация
         result.setdefault('safety_rating', 'warning')
         result.setdefault('additives', [])
         result.setdefault('ai_analysis', '')
         result.setdefault('extracted_text', '')
+        
         return jsonify(result)
 
     except json.JSONDecodeError as e:
