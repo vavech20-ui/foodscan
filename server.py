@@ -87,7 +87,7 @@ def analyze():
             return jsonify({'error': 'GEMINI_API_KEY не задан'}), 500
 
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model = genai.GenerativeModel('gemini-3.6-flash')
 
         # Сжимаем изображение
         image_bytes = compress_image(image)
