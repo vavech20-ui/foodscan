@@ -4,6 +4,7 @@ import requests
 import json
 import os
 import base64
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -52,6 +53,67 @@ def extract_json(text: str) -> dict:
     return json.loads(text)
 
 
+def call_gemini(api_key: str, image_b64: str):
+    """Делает запрос к Gemini с retry при сбоях."""
+    url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent'
+    headers = {'Content-Type': 'application/json'}
+    params = {'key': api_key}
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": SYSTEM_PROMPT + "\n\nПроанализируй состав продукта на фото. Кратко, только важные компоненты."},
+                {
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": image_b64
+                    }
+                }
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 800
+        }
+    }
+
+    # Пробуем 2 раза с интервалом
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                params=params,
+                json=payload,
+                timeout=120
+            )
+
+            if response.status_code == 200:
+                return response.json(), None
+
+            if response.status_code == 429:
+                return None, {'error': 'Превышен лимит запросов. Подождите минуту.', 'status': 429}
+
+            if response.status_code in (500, 502, 503, 504):
+                last_error = f'Google вернул {response.status_code}, retry...'
+                time.sleep(2)
+                continue
+
+            # 4xx ошибки — не ретраим
+            error_text = response.text[:200]
+            return None, {'error': f'Ошибка API ({response.status_code}): {error_text}', 'status': 500}
+
+        except requests.exceptions.Timeout:
+            last_error = 'Timeout, retry...'
+            time.sleep(2)
+            continue
+        except Exception as e:
+            return None, {'error': f'Ошибка соединения: {str(e)[:150]}', 'status': 500}
+
+    return None, {'error': f'Не удалось получить ответ после 2 попыток. {last_error}', 'status': 503}
+
+
 @app.route('/')
 def index():
     return send_from_directory('.', 'index.html')
@@ -71,40 +133,13 @@ def analyze():
 
         image_b64 = decode_image(image)
 
-        # Используем gemini-3.6-flash как просил пользователь
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}'
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"text": SYSTEM_PROMPT + "\n\nПроанализируй состав продукта на фото. Кратко, только важные компоненты."},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": image_b64
-                        }
-                    }
-                ]
-            }],
-            "generationConfig": {
-                "temperature": 0.3,
-                "maxOutputTokens": 800
-            }
-        }
+        # Вызов с retry
+        resp_json, error = call_gemini(api_key, image_b64)
 
-        response = requests.post(url, json=payload, timeout=30)
+        if error:
+            return jsonify({'error': error['error']}), error['status']
 
-        if response.status_code == 429:
-            return jsonify({'error': 'Превышен лимит запросов. Подождите минуту.'}), 429
-
-        if response.status_code == 503:
-            return jsonify({'error': 'Сервис временно недоступен. Попробуйте через минуту.'}), 503
-
-        if response.status_code != 200:
-            error_text = response.text[:200]
-            return jsonify({'error': f'Ошибка API ({response.status_code}): {error_text}'}), 500
-
-        resp_json = response.json()
-
+        # Извлекаем текст
         try:
             text = resp_json['candidates'][0]['content']['parts'][0]['text']
         except (KeyError, IndexError):
@@ -113,6 +148,7 @@ def analyze():
                 'error': f'Не удалось проанализировать. Попробуйте другое фото. ({block_reason})'
             }), 400
 
+        # Парсим JSON
         try:
             result = extract_json(text)
         except json.JSONDecodeError:
