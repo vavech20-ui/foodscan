@@ -50,7 +50,37 @@ def extract_json(text: str) -> dict:
         text = text.split('```json', 1)[1].split('```', 1)[0]
     elif '```' in text:
         text = text.split('```', 1)[1].split('```', 1)[0]
-    return json.loads(text)
+    text = text.strip()
+    
+    # Пробуем распарсить как есть
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    
+    # Если JSON обрезан — пытаемся починить
+    # Закрываем незакрытые строки и скобки
+    if not text.endswith('}'):
+        # Закрываем открытую строку
+        if text.count('"') % 2 != 0:
+            text += '"'
+        # Закрываем массивы и объекты
+        text += ']}' if '"additives"' in text else '}'
+    
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Последняя попытка — извлекаем хотя бы safety_rating
+        import re
+        rating_match = re.search(r'"safety_rating"\s*:\s*"(safe|warning|danger)"', text)
+        analysis_match = re.search(r'"ai_analysis"\s*:\s*"([^"]*)', text)
+        
+        return {
+            'safety_rating': rating_match.group(1) if rating_match else 'warning',
+            'ai_analysis': analysis_match.group(1) if analysis_match else text[:200],
+            'extracted_text': '',
+            'additives': []
+        }
 
 
 def call_gemini(api_key: str, image_b64: str):
@@ -73,7 +103,7 @@ def call_gemini(api_key: str, image_b64: str):
         }],
         "generationConfig": {
             "temperature": 0.3,
-            "maxOutputTokens": 800
+            "maxOutputTokens": 1500
         }
     }
 
