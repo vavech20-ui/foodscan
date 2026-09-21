@@ -1,30 +1,39 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import google.generativeai as genai
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import requests
 import json
 import os
 import base64
-import io
 
 app = Flask(__name__)
 CORS(app)
 
+# Защита от спама: макс 10 запросов в минуту на сервер, 2 с одного IP
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["10 per minute"],
+    storage_uri="memory://"
+)
+
 SYSTEM_PROMPT = """Ты — помощник по анализу состава продуктов питания.
-Проанализируй фото этикетки и верни СТРОГО валидный JSON без markdown и пояснений.
+Проанализируй фото этикетки и верни СТРОГО валидный JSON без markdown.
 
-ВАЖНО: в поле additives включай ТОЛЬКО самые важные компоненты (максимум 8-10 штук).
-Не включай обычные ингредиенты: воду, муку, сахар, соль, молоко, яйца, масло и т.д.
-Фокусируйся только на добавках (E-коды), консервантах, красителях, усилителях вкуса.
+ВАЖНО: в additives включай ТОЛЬКО самые важные компоненты (максимум 8-10 штук).
+Не включай обычные ингредиенты: воду, муку, сахар, соль, молоко, яйца.
+Фокусируйся на добавках (E-коды), консервантах, красителях, усилителях вкуса.
 
-Формат ответа:
+Формат:
 {
   "safety_rating": "safe" | "warning" | "danger",
-  "ai_analysis": "Краткий нейтральный анализ на русском (2-3 предложения)",
-  "extracted_text": "Только ключевые компоненты с этикетки (не более 300 символов)",
+  "ai_analysis": "Краткий анализ на русском (2-3 предложения)",
+  "extracted_text": "Ключевые компоненты с этикетки (до 300 символов)",
   "additives": [
     {
       "name": "Название или E-код",
-      "description": "Кратко: 1 предложение о влиянии",
+      "description": "1 предложение о влиянии",
       "danger_level": "safe" | "warning" | "danger"
     }
   ]
@@ -38,28 +47,11 @@ SYSTEM_PROMPT = """Ты — помощник по анализу состава 
 Если состав не виден — safety_rating: "warning" и объясни в ai_analysis."""
 
 
-def compress_image(image_base64: str) -> bytes:
-    """Сжимает изображение и возвращает bytes."""
-    try:
-        from PIL import Image
-        if ',' in image_base64:
-            image_base64 = image_base64.split(',')[1]
-        img_bytes = base64.b64decode(image_base64)
-        
-        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-        max_side = 1600
-        ratio = min(max_side / img.width, max_side / img.height, 1.0)
-        if ratio < 1.0:
-            img = img.resize((int(img.width*ratio), int(img.height*ratio)), Image.LANCZOS)
-        
-        buf = io.BytesIO()
-        img.save(buf, format='JPEG', quality=85, optimize=True)
-        return buf.getvalue()
-    except Exception as e:
-        print(f'Compression error: {e}')
-        if ',' in image_base64:
-            return base64.b64decode(image_base64.split(',')[1])
-        return base64.b64decode(image_base64)
+def decode_image(image_base64: str) -> str:
+    """Возвращает чистый base64 без префикса."""
+    if ',' in image_base64:
+        return image_base64.split(',')[1]
+    return image_base64
 
 
 def extract_json(text: str) -> dict:
@@ -78,6 +70,7 @@ def index():
 
 
 @app.route('/api/analyze', methods=['POST'])
+@limiter.limit("2 per minute")
 def analyze():
     try:
         data = request.get_json()
@@ -85,42 +78,77 @@ def analyze():
         if not image:
             return jsonify({'error': 'Изображение не получено'}), 400
 
-        # Настраиваем Gemini API
         api_key = os.getenv('GEMINI_API_KEY')
         if not api_key:
             return jsonify({'error': 'GEMINI_API_KEY не задан'}), 500
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-3.6-flash')
+        image_b64 = decode_image(image)
 
-        # Сжимаем изображение
-        image_bytes = compress_image(image)
+        # Защита от слишком больших картинок (> 2 МБ после декодирования)
+        image_bytes_size = len(image_b64) * 3 / 4
+        if image_bytes_size > 2 * 1024 * 1024:
+            return jsonify({'error': 'Изображение слишком большое. Сожмите его.'}), 400
 
-        # Делаем запрос
-        response = model.generate_content([
-            SYSTEM_PROMPT,
-            {
-                'mime_type': 'image/jpeg',
-                'data': image_bytes
-            },
-            'Проанализируй состав продукта на фото.'
-        ])
+        # Прямой HTTP-запрос к Gemini REST API (экономит память)
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}'
 
-        result = extract_json(response.text)
-        
-        # Валидация
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": SYSTEM_PROMPT + "\n\nПроанализируй состав продукта на фото. Кратко, только важные компоненты."},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": image_b64
+                        }
+                    }
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 800
+            }
+        }
+
+        response = requests.post(url, json=payload, timeout=30)
+
+        if response.status_code == 429:
+            return jsonify({'error': 'Превышен лимит запросов. Подождите минуту.'}), 429
+
+        if response.status_code != 200:
+            return jsonify({'error': f'Ошибка API: {response.status_code}'}), 500
+
+        resp_json = response.json()
+
+        # Безопасное извлечение текста
+        try:
+            text = resp_json['candidates'][0]['content']['parts'][0]['text']
+        except (KeyError, IndexError):
+            block_reason = resp_json.get('promptFeedback', {}).get('blockReasonMessage', 'Неизвестно')
+            return jsonify({
+                'error': f'Не удалось проанализировать. Попробуйте другое фото. ({block_reason})'
+            }), 400
+
+        try:
+            result = extract_json(text)
+        except json.JSONDecodeError:
+            return jsonify({
+                'safety_rating': 'warning',
+                'ai_analysis': 'Не удалось разобрать состав. Попробуйте фото при лучшем свете.',
+                'extracted_text': text[:300],
+                'additives': []
+            })
+
         result.setdefault('safety_rating', 'warning')
         result.setdefault('additives', [])
         result.setdefault('ai_analysis', '')
         result.setdefault('extracted_text', '')
-        
+
         return jsonify(result)
 
-    except json.JSONDecodeError as e:
-        return jsonify({'error': f'Модель вернула не-JSON: {str(e)[:100]}'}), 500
     except Exception as e:
         print(f'Error: {e}')
-        return jsonify({'error': f'Ошибка: {str(e)[:200]}'}), 500
+        return jsonify({'error': f'Ошибка сервера: {str(e)[:150]}'}), 500
 
 
 if __name__ == '__main__':
