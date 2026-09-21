@@ -72,8 +72,7 @@ def analyze():
         image_b64 = decode_image(image)
 
         # Используем gemini-3.6-flash как просил пользователь
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}'
-
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}'
         payload = {
             "contents": [{
                 "parts": [
