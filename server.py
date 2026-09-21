@@ -90,7 +90,7 @@ def analyze():
             return jsonify({'error': 'Изображение слишком большое. Сожмите его.'}), 400
 
         # Прямой HTTP-запрос к Gemini REST API (экономит память)
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}'
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}'
 
         payload = {
             "contents": [{
