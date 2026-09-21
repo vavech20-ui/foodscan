@@ -1,7 +1,5 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 import requests
 import json
 import os
@@ -9,14 +7,6 @@ import base64
 
 app = Flask(__name__)
 CORS(app)
-
-# Защита от спама: макс 10 запросов в минуту на сервер, 2 с одного IP
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["10 per minute"],
-    storage_uri="memory://"
-)
 
 SYSTEM_PROMPT = """Ты — помощник по анализу состава продуктов питания.
 Проанализируй фото этикетки и верни СТРОГО валидный JSON без markdown.
@@ -48,14 +38,12 @@ SYSTEM_PROMPT = """Ты — помощник по анализу состава 
 
 
 def decode_image(image_base64: str) -> str:
-    """Возвращает чистый base64 без префикса."""
     if ',' in image_base64:
         return image_base64.split(',')[1]
     return image_base64
 
 
 def extract_json(text: str) -> dict:
-    """Извлекает JSON из ответа модели."""
     text = text.strip()
     if '```json' in text:
         text = text.split('```json', 1)[1].split('```', 1)[0]
@@ -70,7 +58,6 @@ def index():
 
 
 @app.route('/api/analyze', methods=['POST'])
-@limiter.limit("2 per minute")
 def analyze():
     try:
         data = request.get_json()
@@ -84,12 +71,7 @@ def analyze():
 
         image_b64 = decode_image(image)
 
-        # Защита от слишком больших картинок (> 2 МБ после декодирования)
-        image_bytes_size = len(image_b64) * 3 / 4
-        if image_bytes_size > 2 * 1024 * 1024:
-            return jsonify({'error': 'Изображение слишком большое. Сожмите его.'}), 400
-
-        # Прямой HTTP-запрос к Gemini REST API (экономит память)
+        # Используем gemini-3.6-flash как просил пользователь
         url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}'
 
         payload = {
@@ -115,12 +97,15 @@ def analyze():
         if response.status_code == 429:
             return jsonify({'error': 'Превышен лимит запросов. Подождите минуту.'}), 429
 
+        if response.status_code == 503:
+            return jsonify({'error': 'Сервис временно недоступен. Попробуйте через минуту.'}), 503
+
         if response.status_code != 200:
-            return jsonify({'error': f'Ошибка API: {response.status_code}'}), 500
+            error_text = response.text[:200]
+            return jsonify({'error': f'Ошибка API ({response.status_code}): {error_text}'}), 500
 
         resp_json = response.json()
 
-        # Безопасное извлечение текста
         try:
             text = resp_json['candidates'][0]['content']['parts'][0]['text']
         except (KeyError, IndexError):
@@ -135,7 +120,7 @@ def analyze():
             return jsonify({
                 'safety_rating': 'warning',
                 'ai_analysis': 'Не удалось разобрать состав. Попробуйте фото при лучшем свете.',
-                'extracted_text': text[:300],
+                'extracted_text': text[:300] if text else '',
                 'additives': []
             })
 
@@ -152,5 +137,5 @@ def analyze():
 
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 7860))
+    port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
